@@ -16,7 +16,6 @@ type Cache struct {
 	bucketMask  uint32
 	deletables  chan *Item
 	promotables chan *Item
-	donec       chan struct{}
 }
 
 // Create a new cache with the specified configuration
@@ -27,13 +26,15 @@ func New(config *Configuration) *Cache {
 		Configuration: config,
 		bucketMask:    uint32(config.buckets) - 1,
 		buckets:       make([]*bucket, config.buckets),
+		deletables:    make(chan *Item, config.deleteBuffer),
+		promotables:   make(chan *Item, config.promoteBuffer),
 	}
 	for i := 0; i < int(config.buckets); i++ {
 		c.buckets[i] = &bucket{
 			lookup: make(map[string]*Item),
 		}
 	}
-	c.restart()
+	go c.worker()
 	return c
 }
 
@@ -50,6 +51,15 @@ func (c *Cache) Get(key string) *Item {
 		c.promote(item)
 	}
 	return item
+}
+
+// Sample can be used to get an item from the cache without
+// triggering and side effects such as promotion etc.
+//
+// See additional information in the Get method
+//
+func (c *Cache) Sample(key string) *Item {
+	return c.bucket(key).get(key)
 }
 
 // Used when the cache was created with the Track() configuration option.
@@ -80,7 +90,7 @@ func (c *Cache) Replace(key string, value interface{}) bool {
 	return true
 }
 
-// Attempts to get the value from the cache and calles fetch on a miss (missing
+// Attempts to get the value from the cache and calls fetch on a miss (missing
 // or stale item). If fetch returns an error, no value is cached and the error
 // is returned back to the caller.
 func (c *Cache) Fetch(key string, duration time.Duration, fetch func() (interface{}, error)) (*Item, error) {
@@ -118,14 +128,6 @@ func (c *Cache) Clear() {
 // is called are likely to panic
 func (c *Cache) Stop() {
 	close(c.promotables)
-	<-c.donec
-}
-
-func (c *Cache) restart() {
-	c.deletables = make(chan *Item, c.deleteBuffer)
-	c.promotables = make(chan *Item, c.promoteBuffer)
-	c.donec = make(chan struct{})
-	go c.worker()
 }
 
 func (c *Cache) deleteItem(bucket *bucket, item *Item) {
@@ -153,8 +155,6 @@ func (c *Cache) promote(item *Item) {
 }
 
 func (c *Cache) worker() {
-	defer close(c.donec)
-
 	for {
 		select {
 		case item, ok := <-c.promotables:
@@ -202,6 +202,7 @@ func (c *Cache) doPromote(item *Item) bool {
 		if item.shouldPromote(c.getsPerPromote) {
 			c.list.MoveToFront(item.element)
 			item.promotions = 0
+
 		}
 		return false
 	}
